@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 from collections import deque
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -33,9 +34,8 @@ ROOTS = ("/Applications/Claude.app/", "/Applications/ChatGPT.app/",
          str(HOME_DIR / ".codex/computer-use") + "/",
          str(HOME_DIR / "Library/Application Support/Codex") + "/",
          str(HOME_DIR / ".cache/codex-runtimes") + "/")
-VERSION = "3.0-three-site-recheck"
-# Only sites verified on both paths within TIMEOUT are admitted. Keep an odd
-# number of pairs so alternating paths swap on each complete pool rotation.
+VERSION = "3.1-five-site-verification"
+# Only sites verified on both paths within TIMEOUT are admitted.
 SITES = (
     ("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace", "trace"),
     ("ident.me", "https://ident.me", "text"),
@@ -55,15 +55,19 @@ SITES = (
     ("ipaddress.sh", "https://ipaddress.sh/", "text"),
     ("ip.me", "https://ip.me/", "text"),
     ("wgetip.com", "https://wgetip.com/", "text"),
+    ("IPIP0", "https://ipip0.net/en", "ipip0_html"),
+    ("IPPure", "https://my.ippure.com/v1/info", "json_ip"),
 )
 RECHECK_PRIORITY = ("Cloudflare", "ipify", "Amazon", "ident.me", "icanhazip")
+PHASE_SIZES = {"regular": 2, "recheck": 3, "extended": 5}
 
 
-def select_recheck_sites(excluded):
+def select_recheck_sites(excluded, count=3):
     by_name = {site[0]: site for site in SITES}
-    selected = tuple(by_name[name] for name in RECHECK_PRIORITY if name not in excluded)[:3]
-    if len(selected) != 3:
-        raise ValueError("Recheck requires three different additional websites")
+    priority = RECHECK_PRIORITY + tuple(name for name in by_name if name not in RECHECK_PRIORITY)
+    selected = tuple(by_name[name] for name in priority if name not in excluded)[:count]
+    if len(selected) != count:
+        raise ValueError("Recheck requires %d different additional websites" % count)
     return selected
 
 
@@ -75,6 +79,7 @@ class ProbeRound:
     mode: str
     phase: str = "regular"
     trigger_seq: Optional[int] = None
+    excluded_sites: tuple = ()
     started: Optional[float] = None
     results: dict = field(default_factory=dict)
 
@@ -84,7 +89,12 @@ def select_pair(sequence):
     sites = (SITES[index], SITES[(index + 1) % len(SITES)])
     # Two websites on ONE path per round, alternating paths each second. This
     # can detect a faulty default path even when the local proxy remains good.
-    mode = "default_route" if sequence % 2 else "nextin_proxy"
+    pair_count = len(SITES) // 2
+    cycle = (sequence - 1) // pair_count
+    # An even pair count needs an explicit path swap after each full rotation.
+    # Its boundary consequently has two consecutive rounds on the same path.
+    offset = cycle if pair_count % 2 == 0 else 0
+    mode = "default_route" if (sequence + offset) % 2 else "nextin_proxy"
     return sites, mode
 
 
@@ -132,11 +142,13 @@ class State:
 
     def result(self, epoch, seq, started, results, mode, phase="regular"):
         previous = self.path_rounds.get(mode)
-        window = FRESH_FOR + (INTERVAL if phase == "recheck" else 0)
+        expected_count = PHASE_SIZES[phase]
+        # Five sites occupy three dispatch slots; their last request starts two
+        # seconds after the first, before its own normal three-second timeout.
+        window = FRESH_FOR + ((expected_count - 1) // 2) * INTERVAL
         if (epoch != self.epoch or (previous and seq <= previous["seq"])
                 or self.clock() - started >= window):
             return False
-        expected_count = {"regular": 2, "recheck": 3}[phase]
         if len(results) != expected_count or len({r["site"] for r in results}) != expected_count:
             raise ValueError("A decision requires %d distinct websites" % expected_count)
         self.last_seq = seq
@@ -149,8 +161,10 @@ class State:
             reason = "exit_mismatch"
             self.request_close(mode, seq, reason, results)
         elif good == 0:
-            reason = "recheck_failed" if phase == "recheck" else "awaiting_three_site_recheck"
-            if phase == "recheck":
+            reason = {"regular": "awaiting_three_site_recheck",
+                      "recheck": "awaiting_five_site_verification",
+                      "extended": "extended_verification_failed"}[phase]
+            if phase == "extended":
                 self.request_close(mode, seq, reason, results)
         else:
             reason = "verified" if good == expected_count else "one_site_ok"
@@ -165,7 +179,7 @@ class State:
     def should_close(self):
         # A healthy proxy result cannot erase a failed default-path pair (or
         # vice versa); recovery and ordering are evaluated separately per path.
-        return bool(self.alerts) or any(item["reason"] in ("exit_mismatch", "recheck_failed")
+        return bool(self.alerts) or any(item["reason"] in ("exit_mismatch", "extended_verification_failed")
                                        and 0 <= self.clock() - item["completed"] < FRESH_FOR
                                        for item in self.path_rounds.values())
 
@@ -173,7 +187,7 @@ class State:
         reasons = [item["reason"] for item in self.alerts.values()]
         reasons += [item["reason"] for item in self.path_rounds.values()
                     if 0 <= self.clock() - item["completed"] < FRESH_FOR]
-        return "exit_mismatch" if "exit_mismatch" in reasons else "recheck_failed"
+        return "exit_mismatch" if "exit_mismatch" in reasons else "extended_verification_failed"
 
     def status(self):
         good = sum(item["ok"] for item in self.results)
@@ -184,7 +198,7 @@ class State:
                 "results": self.results, "path": self.path, "round": self.last_seq,
                 "path_rounds": self.path_rounds,
                 "alerts": self.alerts,
-                "expected_exit": EXPECTED, "mode": "three_site_recheck_no_firewall",
+                "expected_exit": EXPECTED, "mode": "two_three_five_site_verification_no_firewall",
                 "version": VERSION, "site_pool_size": len(SITES),
                 "requests_per_second": 2, "timeout_seconds": TIMEOUT,
                 "updated_at": time.time(), "pid": os.getpid()}
@@ -218,7 +232,8 @@ async def output(args, timeout=TIMEOUT + .3):
 
 async def probe(site, mode):
     name, url, kind = site
-    args = ["/usr/bin/curl", "--silent", "--show-error", "--fail", "--max-filesize", "8192",
+    limit = "131072" if kind == "ipip0_html" else "8192"
+    args = ["/usr/bin/curl", "--silent", "--show-error", "--fail", "--max-filesize", limit,
             "--user-agent", "curl/8.7.1 TaiwanExitWatch/2.0",
             "--header", "Cache-Control: no-cache",
             "--connect-timeout", str(TIMEOUT), "--max-time", str(TIMEOUT), "--proto", "=https"]
@@ -234,6 +249,27 @@ async def probe(site, mode):
         if len(values) != 1:
             raise ValueError("Response does not contain exactly one ip= field")
         value = values[0]
+    elif kind == "json_ip":
+        value = json.loads(body)["ip"]
+        if not isinstance(value, str):
+            raise ValueError("JSON ip field must be a string")
+    elif kind == "ipip0_html":
+        # Read only the server's prefilled visitor-IP field on an unparameterized
+        # GET. Do not treat queried-IP results, ads or other HTML IPs as evidence.
+        class VisitorIP(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.values = []
+
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if tag == "input" and attrs.get("id") == "query-input" and attrs.get("name") == "query":
+                    self.values.append(attrs.get("value", ""))
+        parser = VisitorIP()
+        parser.feed(body)
+        if len(parser.values) != 1:
+            raise ValueError("IPIP0 page must contain exactly one visitor-IP input")
+        value = parser.values[0]
     else:
         value = body.strip()
     import ipaddress
@@ -332,16 +368,20 @@ class Monitor:
         self.recheck_queue = deque()
 
     def queue_recheck(self, original):
-        if original.epoch != self.state.epoch or original.mode in self.rechecks:
+        active = self.rechecks.get(original.mode)
+        if (original.epoch != self.state.epoch or original.phase == "extended"
+                or (active is not None and active is not original)):
             return
+        phase = "recheck" if original.phase == "regular" else "extended"
+        excluded = set(original.excluded_sites) | {site[0] for site in original.sites}
         self.sequence += 1
-        sites = select_recheck_sites({site[0] for site in original.sites})
+        sites = select_recheck_sites(excluded, PHASE_SIZES[phase])
         batch = ProbeRound(original.epoch, self.sequence, sites, original.mode,
-                           phase="recheck", trigger_seq=original.seq)
+                           phase=phase, trigger_seq=original.seq, excluded_sites=tuple(sorted(excluded)))
         self.rechecks[batch.mode] = batch
         self.recheck_queue.extend((batch, site) for site in sites)
-        logging.warning("recheck_queued round=%s trigger_round=%s path=%s sites=%s",
-                        batch.seq, original.seq, batch.mode, [site[0] for site in sites])
+        logging.warning("recheck_queued round=%s trigger_round=%s path=%s phase=%s sites=%s",
+                        batch.seq, original.seq, batch.mode, phase, [site[0] for site in sites])
 
     async def check_site(self, batch, site):
         started = time.monotonic()
@@ -366,10 +406,10 @@ class Monitor:
                 logging.warning("round_details=%s", json.dumps({"round": batch.seq,
                                 "phase": batch.phase, "trigger_round": batch.trigger_seq,
                                 "results": results}, ensure_ascii=False))
-            if batch.phase == "regular" and good == 0 and not any(
+            if batch.phase != "extended" and good == 0 and not any(
                     r.get("outcome") == "exit_mismatch" for r in results):
                 self.queue_recheck(batch)
-        if batch.phase == "recheck" and self.rechecks.get(batch.mode) is batch:
+        if batch.phase != "regular" and self.rechecks.get(batch.mode) is batch:
             del self.rechecks[batch.mode]
 
     async def check(self, epoch, seq, started, sites=None, mode=None):
@@ -387,7 +427,7 @@ class Monitor:
             if batch.epoch == self.state.epoch:
                 jobs.append((batch, site))
         if not jobs:
-            # Finish the three-site decision before opening another normal
+            # Finish staged verification before opening another normal
             # round; a newer round must not hide this recheck's conclusion.
             if self.rechecks:
                 return []
@@ -412,6 +452,7 @@ class Monitor:
     def status(self):
         value = self.state.status()
         value["pending_rechecks"] = {mode: {"round": batch.seq, "trigger_round": batch.trigger_seq,
+                                          "phase": batch.phase,
                                           "sites": [site[0] for site in batch.sites],
                                           "completed_sites": len(batch.results)}
                                      for mode, batch in self.rechecks.items()}
@@ -462,7 +503,7 @@ class Monitor:
 
     async def run(self):
         # Startup, topology changes and stale results do not independently close
-        # apps. A wrong IP or a failed three-site recheck can do that.
+        # apps. A wrong IP or a failed final five-site check can do that.
         tasks = [asyncio.create_task(coro()) for coro in
                  (self.exit_loop, self.topology_loop, self.safety_loop)]
         try:
@@ -501,7 +542,7 @@ def start():
     loaded = subprocess.run(["/bin/launchctl", "print", domain + "/" + LABEL], capture_output=True)
     if loaded.returncode:
         subprocess.run(["/bin/launchctl", "bootstrap", domain, str(PLIST)], check=True)
-    print("检测已启动并设为登录自启。每秒最多两个请求；错误 IP 立即关闭，双站失败后换三站复核。")
+    print("检测已启动并设为登录自启。每秒最多两个请求；错误 IP 立即关闭，超时按 2→3→5 个网站验证。")
 
 
 def stop():
@@ -515,9 +556,13 @@ def stop():
 async def check_once():
     monitor = Monitor()
     await monitor.check(0, 1, time.monotonic())
-    while monitor.recheck_queue and not monitor.state.should_close():
+    # Use the same overlapping dispatch cadence as the service. Awaiting each
+    # two-request batch separately would make the final five-site group stale.
+    while monitor.rechecks and not monitor.state.should_close():
         await asyncio.sleep(INTERVAL)
-        await asyncio.gather(*monitor.dispatch())
+        if monitor.rechecks and not monitor.state.should_close():
+            monitor.dispatch()
+    await asyncio.gather(*list(monitor.checks))
     print(json.dumps(dict(monitor.status(), apps_closed=False), ensure_ascii=False, indent=2))
     return not monitor.state.should_close()
 
@@ -531,13 +576,13 @@ def main():
         handler = RotatingFileHandler(LOGS / "watch.log", maxBytes=1048576, backupCount=3)
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         logging.basicConfig(level=logging.INFO, handlers=[handler])
-        logging.info("monitor_started version=%s sites=%s requests_per_second=2 timeout=%s policy=mismatch_or_three_site_recheck",
+        logging.info("monitor_started version=%s sites=%s requests_per_second=2 timeout=%s policy=mismatch_or_two_three_five_site_verification",
                      VERSION, len(SITES), TIMEOUT)
         monitor = Monitor()
         try:
             asyncio.run(monitor.run())
         except BaseException:
-            # An internal exception is not a completed three-site recheck.
+            # An internal exception is not a completed five-site verification.
             write_status({"exit_confirmed": False, "close_apps": False,
                           "reason": "monitor_failed", "updated_at": time.time()})
             raise
