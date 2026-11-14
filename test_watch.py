@@ -82,17 +82,17 @@ class StateTests(unittest.TestCase):
         self.assertFalse(self.apply([result('a',False),result('b',False)],epoch=old_epoch))
 
     def test_other_path_success_cannot_erase_failed_recheck(self):
-        self.apply([result(str(i),False) for i in range(5)],seq=1,phase='extended')
+        self.apply([result(str(i),False) for i in range(3)],seq=1,phase='final')
         self.state.result(0,2,self.now,[result('c'),result('d')],'nextin_proxy')
         self.assertTrue(self.state.should_close())
 
     def test_old_failure_on_different_path_still_counts(self):
         self.state.result(0,2,self.now,[result('c'),result('d')],'nextin_proxy')
-        self.assertTrue(self.apply([result(str(i),False) for i in range(5)],seq=1,phase='extended'))
+        self.assertTrue(self.apply([result(str(i),False) for i in range(3)],seq=1,phase='final'))
         self.assertTrue(self.state.should_close())
 
     def test_confirmed_failure_is_not_cancelled_before_stop_attempt(self):
-        self.apply([result(str(i),False) for i in range(5)],seq=1,phase='extended')
+        self.apply([result(str(i),False) for i in range(3)],seq=1,phase='final')
         tokens={mode:alert['token'] for mode,alert in self.state.alerts.items()}
         self.apply([result('e'),result('f',False)],seq=3)
         self.assertTrue(self.state.should_close())
@@ -114,10 +114,22 @@ class StateTests(unittest.TestCase):
         self.assertFalse(self.state.should_close())
         self.assertEqual(self.state.reason,'awaiting_five_site_verification')
 
-    def test_extended_all_errors_closes(self):
+    def test_extended_all_errors_waits_for_final_three(self):
         self.apply([result(str(i),False) for i in range(5)],phase='extended')
+        self.assertFalse(self.state.should_close())
+        self.assertEqual(self.state.reason,'awaiting_final_three_site_verification')
+
+    def test_final_all_errors_closes(self):
+        self.apply([result(str(i),False) for i in range(3)],phase='final')
         self.assertTrue(self.state.should_close())
-        self.assertEqual(self.state.close_reason(),'extended_verification_failed')
+        self.assertEqual(self.state.close_reason(),'final_three_verification_failed')
+
+    def test_final_one_correct_site_recovers_but_mismatch_always_closes(self):
+        for position in range(3):
+            self.apply([result(str(i),i==position) for i in range(3)],seq=position+1,phase='final')
+            self.assertFalse(self.state.should_close())
+        self.apply([result('a'),result('b'),result('c',False,outcome='exit_mismatch')],seq=4,phase='final')
+        self.assertTrue(self.state.should_close())
 
     def test_extended_one_good_anywhere_does_not_close(self):
         for position in range(5):
@@ -173,35 +185,44 @@ class StateTests(unittest.TestCase):
             self.assertFalse(self.state.should_close())
 
 
-class RotationTests(unittest.TestCase):
-    def test_at_least_ten_distinct_sites(self):
-        self.assertGreaterEqual(len(watch.SITES),10)
+class SelectionTests(unittest.TestCase):
+    def test_pool_has_enough_distinct_sites_for_full_recheck_chain(self):
+        self.assertGreaterEqual(len(watch.SITES),13)
+        self.assertEqual(len({s[0] for s in watch.SITES}),len(watch.SITES))
         self.assertEqual(len({urlsplit(s[1]).hostname for s in watch.SITES}),len(watch.SITES))
-        self.assertEqual(len(watch.SITES)%2,0)
 
-    def test_two_distinct_per_round_all_sites_covered(self):
-        seen=set()
-        for i in range(1,len(watch.SITES)//2+1):
-            pair,mode=watch.select_pair(i)
-            self.assertEqual(len(pair),2)
-            self.assertNotEqual(pair[0][0],pair[1][0])
-            seen.update(s[0] for s in pair)
-        self.assertEqual(seen,{s[0] for s in watch.SITES})
+    def test_each_round_samples_entire_pool_and_alternates_paths(self):
+        # The sampler may return the same pair again; no ordered-rotation fallback.
+        with patch.object(watch.random, 'sample', return_value=list(watch.SITES[-2:])) as sample:
+            for seq in range(1, 5):
+                pair, mode = watch.select_pair(seq)
+                self.assertEqual(pair, watch.SITES[-2:])
+                self.assertEqual(mode, 'default_route' if seq % 2 else 'nextin_proxy')
+            self.assertEqual(sample.call_count, 4)
+            sample.assert_called_with(watch.SITES, 2)
 
-    def test_every_site_uses_both_paths_across_two_cycles(self):
-        paths={s[0]:set() for s in watch.SITES}
-        for i in range(1,len(watch.SITES)+1):
-            pair,mode=watch.select_pair(i)
-            for s in pair:paths[s[0]].add(mode)
-        self.assertTrue(all(v=={'default_route','nextin_proxy'} for v in paths.values()))
+    def test_seeded_random_draws_are_distinct_and_exercise_both_paths(self):
+        import random
+        rng = random.Random(716)
+        paths = {site[0]: set() for site in watch.SITES}
+        with patch.object(watch.random, 'sample', side_effect=rng.sample):
+            for seq in range(1, 241):
+                pair, mode = watch.select_pair(seq)
+                self.assertEqual(len({s[0] for s in pair}), 2)
+                for site in pair: paths[site[0]].add(mode)
+        self.assertTrue(all(modes == {'default_route', 'nextin_proxy'} for modes in paths.values()))
 
-    def test_even_pair_pool_still_checks_each_site_over_both_paths(self):
-        with patch.object(watch,'SITES',watch.SITES[:20]):
-            paths={s[0]:set() for s in watch.SITES}
-            for seq in range(1,21):
-                pair,mode=watch.select_pair(seq)
-                for site in pair:paths[site[0]].add(mode)
-        self.assertTrue(all(p=={'default_route','nextin_proxy'} for p in paths.values()))
+    def test_recheck_samples_only_sites_not_used_in_this_chain(self):
+        import random
+        excluded = {s[0] for s in watch.SITES[:10]}
+        rng = random.Random(193)
+        with patch.object(watch.random, 'sample', side_effect=rng.sample) as sample:
+            chosen = watch.select_recheck_sites(excluded, 3)
+        self.assertEqual(len({s[0] for s in chosen}), 3)
+        self.assertFalse({s[0] for s in chosen} & excluded)
+        self.assertEqual(sample.call_args.args[0], list(watch.SITES[10:]))
+        with self.assertRaises(ValueError):
+            watch.select_recheck_sites({s[0] for s in watch.SITES[:-2]}, 3)
 
 
 class ProcessTests(unittest.IsolatedAsyncioTestCase):
@@ -252,6 +273,22 @@ class ProcessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_result_records_request_times_and_last_observed_topology(self):
+        monitor=watch.Monitor()
+        monitor.topology_ok=True
+        monitor.current_topology=('vpn','utun6',('1',))
+        monitor.topology_observed_at='2026-11-02T12:00:00+00:00'
+        async def fake(site,mode):return watch.EXPECTED
+        with patch.object(watch,'probe',fake),self.assertLogs(level='INFO') as logs:
+            await monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route')
+        for item in monitor.state.results:
+            self.assertIn('started_at',item)
+            self.assertIn('completed_at',item)
+            self.assertEqual(item['topology_at_start']['interface'],'utun6')
+            self.assertEqual(item['topology_at_start']['observed_at'],'2026-11-02T12:00:00+00:00')
+            self.assertEqual(item['topology_epoch_at_completion'],0)
+        self.assertTrue(any('round_details=' in line for line in logs.output))
+
     async def test_waits_for_second_site_before_deciding(self):
         event=asyncio.Event()
         async def fake(site,mode):
@@ -259,7 +296,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             await event.wait();return watch.EXPECTED
         monitor=watch.Monitor()
         with patch.object(watch,'probe',fake):
-            task=asyncio.create_task(monitor.check(0,1,time.monotonic()))
+            task=asyncio.create_task(monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route'))
             await asyncio.sleep(.01)
             self.assertFalse(task.done());self.assertFalse(monitor.state.should_close())
             event.set();await task
@@ -277,7 +314,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         async def fake(site,mode):raise watch.CommandError(28,'Operation timed out after 3000 milliseconds')
         monitor=watch.Monitor()
         with patch.object(watch,'probe',fake),self.assertLogs(level='WARNING') as logs:
-            await monitor.check(0,1,time.monotonic())
+            await monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route')
         self.assertFalse(monitor.state.should_close())
         self.assertEqual(len(monitor.recheck_queue),3)
         batch=monitor.rechecks['default_route']
@@ -293,7 +330,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             await event.wait();return watch.EXPECTED
         monitor=watch.Monitor()
         with patch.object(watch,'probe',fake):
-            task=asyncio.create_task(monitor.check(0,1,time.monotonic()))
+            task=asyncio.create_task(monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route'))
             try:
                 await asyncio.sleep(.01)
                 self.assertFalse(task.done())
@@ -397,7 +434,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 before=len(calls)
                 await asyncio.gather(*monitor.dispatch())
                 self.assertLessEqual(len(calls)-before,2)
-        self.assertEqual(len(calls),16)
+        self.assertEqual(len(calls),22)
         self.assertEqual(monitor.rechecks,{})
         self.assertEqual(set(monitor.state.alerts),{'default_route','nextin_proxy'})
 
@@ -419,14 +456,14 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 item=await watch.probe_result(('IPIP0','https://ipip0.net/en','ipip0_html'),'default_route')
                 self.assertFalse(item['ok'])
 
-    async def test_all_requests_share_two_per_second_slots(self):
+    async def test_all_requests_share_two_per_three_second_slots(self):
         class End(Exception):pass
         original_sleep=asyncio.sleep
         tick=[0];calls=[]
         async def sleep(_):
             await original_sleep(0)
             tick[0]+=1
-            if tick[0]==6:raise End()
+            if tick[0]==8:raise End()
         async def fake(site,mode):
             calls.append((tick[0],site[0],mode));raise TimeoutError('timeout')
         monitor=watch.Monitor()
@@ -437,8 +474,8 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(c<=2 for c in Counter(t for t,_,_ in calls).values()))
         self.assertEqual([sum(t==i for t,_,_ in calls) for i in range(3)],[2,2,1])
         self.assertEqual(len({s for t,s,_ in calls if t<3}),5)
-        self.assertEqual([sum(t==i for t,_,_ in calls) for i in range(6)],[2,2,1,2,2,1])
-        self.assertEqual(len({s for _,s,_ in calls}),10)
+        self.assertEqual([sum(t==i for t,_,_ in calls) for i in range(8)],[2,2,1,2,2,1,2,1])
+        self.assertEqual(len({s for _,s,_ in calls}),13)
         self.assertTrue(monitor.state.should_close())
 
     async def test_pending_recheck_prevents_new_round_and_duplicate_recheck(self):
@@ -507,13 +544,13 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(watch,'write_status'),patch.object(watch.asyncio,'sleep',sleep):
             with self.assertRaises(End):await monitor.safety_loop()
 
-    async def test_no_process_signals_until_all_five_final_checks_fail(self):
+    async def test_no_process_signals_until_final_three_checks_fail(self):
         monitor=watch.Monitor()
         async def fake(site,mode):raise TimeoutError('timeout')
         table={10:dict(ppid=1,path='/Applications/Claude.app/Contents/MacOS/Claude',birth=('first',))}
         with patch.object(watch,'probe',fake),patch.object(watch,'process_table',return_value=table), \
              patch.object(watch.os,'kill') as kill:
-            await monitor.check(0,1,time.monotonic())
+            await monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route')
             await self.pass_once(monitor)
             kill.assert_not_called()
             await asyncio.gather(*monitor.dispatch())
@@ -528,6 +565,12 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
                 kill.assert_not_called()
             await asyncio.gather(*monitor.dispatch())
             await self.pass_once(monitor)
+            kill.assert_not_called()
+            await asyncio.gather(*monitor.dispatch())
+            await self.pass_once(monitor)
+            kill.assert_not_called()
+            await asyncio.gather(*monitor.dispatch())
+            await self.pass_once(monitor)
             self.assertEqual([c.args for c in kill.call_args_list],
                              [(10,signal.SIGSTOP),(10,signal.SIGKILL)])
 
@@ -538,7 +581,7 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
             await event.wait();return watch.EXPECTED
         monitor=watch.Monitor()
         with patch.object(watch,'probe',fake),patch.object(watch,'stop_apps',new_callable=AsyncMock,return_value=[]) as stop:
-            task=asyncio.create_task(monitor.check(0,1,time.monotonic()))
+            task=asyncio.create_task(monitor.check(0,1,time.monotonic(),sites=watch.SITES[:2],mode='default_route'))
             try:
                 await asyncio.sleep(.01)
                 await self.pass_once(monitor)
@@ -573,9 +616,173 @@ class SafetyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(watch,'INTERVAL',.04),patch.object(watch,'FRESH_FOR',.14), \
              patch.object(watch,'probe',slow),patch.object(watch.os,'kill') as kill,patch('builtins.print'):
             self.assertFalse(await watch.check_once())
-        self.assertEqual(len(calls),10)
-        self.assertEqual(len(set(calls)),10)
+        self.assertEqual(len(calls),13)
+        self.assertEqual(len(set(calls)),13)
         kill.assert_not_called()
+
+
+
+class AuditPersistenceTests(unittest.TestCase):
+    def test_status_is_limited_to_two_seconds_but_risk_writes_immediately(self):
+        publisher = watch.StatusPublisher()
+        healthy = dict(close_apps=False, reason='verified')
+        with patch.object(watch, 'write_status') as writer:
+            for now in [0, .25, .5, 1, 1.75]:
+                publisher.publish(healthy, now)
+            self.assertEqual(writer.call_count, 1)
+            publisher.publish(healthy, 2)
+            self.assertEqual(writer.call_count, 2)
+            publisher.publish(dict(close_apps=True, reason='exit_mismatch'), 2.1)
+            self.assertEqual(writer.call_count, 3)
+            publisher.publish(healthy, 2.2)
+            self.assertEqual(writer.call_count, 4)
+
+    def test_batch_writes_once_and_preserves_original_event_times(self):
+        import tempfile, logging
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'watch.log'
+            handler = watch.BatchLogHandler(path)
+            try:
+                with patch.object(handler.sink, 'emit', wraps=handler.sink.emit) as sink:
+                    for message in ['round=1', 'round=2', 'recheck_queued']:
+                        handler.handle(logging.LogRecord('test', logging.WARNING, '', 0, message, (), None))
+                    sink.assert_not_called()
+                    handler.flush()
+                    sink.assert_called_once()
+                text = path.read_text()
+                self.assertIn('round=1\n', text)
+                self.assertIn('round=2\n', text)
+                self.assertEqual(len(text.splitlines()), 3)
+                handler.handle(logging.LogRecord('test', logging.INFO, '', 0, 'last ordinary event', (), None))
+            finally:
+                handler.close()
+            self.assertIn('last ordinary event', path.read_text())
+
+    def test_wrong_ip_and_lifecycle_flush_prior_ordinary_records(self):
+        import tempfile, logging
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'watch.log'
+            handler = watch.BatchLogHandler(path)
+            try:
+                for message in ['exit_mismatch round=2', 'apps_state_changed={}', 'monitor_stopped']:
+                    handler.handle(logging.LogRecord('test', logging.INFO, '', 0, 'ordinary', (), None))
+                    handler.handle(logging.LogRecord('test', logging.WARNING, '', 0, message, (), None))
+                    self.assertEqual(handler.pending, [])
+                    self.assertIn(message, path.read_text())
+            finally:
+                handler.close()
+
+    def test_app_roots_exclude_descendants_and_include_birth_for_pid_reuse(self):
+        table = {10: dict(ppid=1, birth=('first',), path='/Applications/Claude.app/Contents/MacOS/Claude'),
+                 11: dict(ppid=10, birth=('child',), path='/usr/bin/tool'),
+                 20: dict(ppid=1, birth=('second',), path='/Applications/ChatGPT.app/Contents/MacOS/ChatGPT')}
+        snapshot = watch.app_snapshot(table)
+        self.assertEqual([x['pid'] for x in snapshot['Claude']['roots']], [10])
+        self.assertEqual(snapshot['Codex']['roots'][0]['birth'], ('second',))
+        self.assertFalse(watch.app_snapshot({})['Claude']['running'])
+        self.assertFalse(watch.app_snapshot({})['Codex']['running'])
+
+
+class AppAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def test_app_restart_and_exit_are_logged(self):
+        class End(Exception): pass
+        calls = 0
+        root = dict(ppid=1, birth=('first',), path='/Applications/Claude.app/Contents/MacOS/Claude')
+        async def sleep(_):
+            nonlocal calls
+            calls += 1
+            if calls == 3: raise End()
+        monitor = watch.Monitor()
+        with patch.object(watch, 'process_table', side_effect=[{}, {10: root}, {}]), \
+             patch.object(watch.asyncio, 'sleep', sleep), self.assertLogs(level='INFO') as logs:
+            with self.assertRaises(End): await monitor.apps_loop()
+        self.assertEqual(sum('apps_state_changed=' in line for line in logs.output), 2)
+        self.assertFalse(monitor.apps_observed['apps']['Claude']['running'])
+        self.assertIsNotNone(monitor.apps_observed['observed_at'])
+
+    async def test_probe_preserves_observation_timestamps_and_known_absence(self):
+        monitor = watch.Monitor()
+        observed = dict(observed_at='2026-11-06T07:00:00Z', apps=watch.app_snapshot({}))
+        monitor.apps_observed = observed
+        async def fake(site, mode): return watch.EXPECTED
+        with patch.object(watch, 'probe', fake):
+            await monitor.check(0, 1, time.monotonic(), sites=watch.SITES[:2], mode='default_route')
+        for item in monitor.status()['results']:
+            self.assertEqual(item['apps_at_start']['observed_at'], observed['observed_at'])
+            self.assertFalse(item['apps_at_start']['apps']['Claude']['running'])
+            self.assertEqual(item['apps_at_start'], item['apps_at_completion'])
+
+class FinalStageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_thirteenth_site_can_recover_and_all_sites_are_distinct(self):
+        monitor = watch.Monitor()
+        calls = []
+        async def probe(site, mode):
+            calls.append(site[0])
+            if len(calls) == 13: return watch.EXPECTED
+            raise TimeoutError('simulated timeout')
+        with patch.object(watch, 'probe', probe):
+            await monitor.check(0, 1, time.monotonic(), sites=watch.SITES[:2], mode='default_route')
+            while monitor.recheck_queue:
+                await asyncio.gather(*monitor.dispatch())
+                self.assertFalse(monitor.state.should_close())
+        self.assertEqual(len(calls), 13)
+        self.assertEqual(len(set(calls)), 13)
+        self.assertFalse(monitor.rechecks)
+        self.assertEqual(monitor.state.path_rounds['default_route']['phase'], 'final')
+
+    async def test_wrong_ip_in_final_stage_closes_before_other_sites_finish(self):
+        monitor = watch.Monitor()
+        gate = asyncio.Event()
+        batch = watch.ProbeRound(0, 4, watch.SITES[:3], 'default_route', phase='final')
+        async def probe(site, mode):
+            if site == batch.sites[0]: return '198.51.100.7'
+            await gate.wait()
+            return watch.EXPECTED
+        with patch.object(watch, 'probe', probe):
+            task = asyncio.create_task(monitor.check_site(batch, batch.sites[1]))
+            try:
+                await monitor.check_site(batch, batch.sites[0])
+                self.assertTrue(monitor.state.should_close())
+                self.assertFalse(task.done())
+            finally:
+                gate.set()
+                await task
+
+
+class ExpandedPoolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_registered_sites_parse_their_actual_response_shapes(self):
+        fixtures = {'GeoJS': '{"ip":"103.131.112.53"}',
+                    'FreeIPAPI': '{"ipVersion":4,"ipAddress":"103.131.112.53"}',
+                    'ipaddress.fi': '103.131.112.53\n',
+                    'HTTPBin': '{"origin":"103.131.112.53"}'}
+        sites = [s for s in watch.SITES if s[0] in fixtures]
+        self.assertEqual(len(sites), 4)
+        for site in sites:
+            for mode in ('default_route', 'nextin_proxy'):
+                with patch.object(watch, 'output', new_callable=AsyncMock, return_value=fixtures[site[0]]):
+                    self.assertEqual(await watch.probe(site, mode), watch.EXPECTED)
+
+    async def test_error_objects_and_ambiguous_origins_are_failures_not_ip_evidence(self):
+        cases = [('json_ip_address','{"ipAddress":"103.131.112.53","error":"limited"}'),
+                 ('json_ip_address','{"ipAddress":null}'),
+                 ('json_origin','{"origin":"103.131.112.53, 1.1.1.1"}'),
+                 ('json_origin','{"origin":["103.131.112.53"]}'),
+                 ('json_ip','{"ip":"103.131.112.53","success":false}')]
+        for kind, body in cases:
+            with patch.object(watch, 'output', new_callable=AsyncMock, return_value=body):
+                sample = await watch.probe_result(('test','https://test.invalid/',kind),'default_route')
+                self.assertFalse(sample['ok'])
+                self.assertEqual(sample['outcome'],'probe_failed')
+                self.assertNotIn('ip',sample)
+
+    async def test_new_json_fields_still_report_a_wrong_ipv4_or_ipv6(self):
+        for kind, body in [('json_ip_address','{"ipAddress":"198.51.100.7"}'),
+                           ('json_origin','{"origin":"2001:db8::7"}')]:
+            with patch.object(watch, 'output', new_callable=AsyncMock, return_value=body):
+                sample = await watch.probe_result(('test','https://test.invalid/',kind),'nextin_proxy')
+                self.assertEqual(sample['outcome'],'exit_mismatch')
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

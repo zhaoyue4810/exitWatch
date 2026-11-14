@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import contextlib
+from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -13,6 +14,7 @@ import os
 from pathlib import Path
 import plistlib
 import re
+import random
 import shutil
 import signal
 import subprocess
@@ -21,8 +23,8 @@ import time
 from typing import Optional
 
 EXPECTED = "103.131.112.53"
-INTERVAL = 1.0
-TIMEOUT = 3.0
+INTERVAL = 3.0
+TIMEOUT = 4.0
 FRESH_FOR = INTERVAL + TIMEOUT + .2
 LABEL = "local.taiwan-exit-watch"
 HOME_DIR = Path.home()
@@ -34,7 +36,10 @@ ROOTS = ("/Applications/Claude.app/", "/Applications/ChatGPT.app/",
          str(HOME_DIR / ".codex/computer-use") + "/",
          str(HOME_DIR / "Library/Application Support/Codex") + "/",
          str(HOME_DIR / ".cache/codex-runtimes") + "/")
-VERSION = "3.1-five-site-verification"
+VERSION = "3.6-random-site-selection"
+STATUS_INTERVAL = 2.0
+LOG_FLUSH_INTERVAL = 10.0
+APP_POLL_INTERVAL = 1.0
 # Only sites verified on both paths within TIMEOUT are admitted.
 SITES = (
     ("Cloudflare", "https://www.cloudflare.com/cdn-cgi/trace", "trace"),
@@ -57,18 +62,19 @@ SITES = (
     ("wgetip.com", "https://wgetip.com/", "text"),
     ("IPIP0", "https://ipip0.net/en", "ipip0_html"),
     ("IPPure", "https://my.ippure.com/v1/info", "json_ip"),
+    ("GeoJS", "https://get.geojs.io/v1/ip.json", "json_ip"),
+    ("FreeIPAPI", "https://free.freeipapi.com/api/v1/json/", "json_ip_address"),
+    ("ipaddress.fi", "https://ipaddress.fi/api/v1/my-ip?format=text", "text"),
+    ("HTTPBin", "https://httpbin.org/ip", "json_origin"),
 )
-RECHECK_PRIORITY = ("Cloudflare", "ipify", "Amazon", "ident.me", "icanhazip")
-PHASE_SIZES = {"regular": 2, "recheck": 3, "extended": 5}
+PHASE_SIZES = {"regular": 2, "recheck": 3, "extended": 5, "final": 3}
 
 
 def select_recheck_sites(excluded, count=3):
-    by_name = {site[0]: site for site in SITES}
-    priority = RECHECK_PRIORITY + tuple(name for name in by_name if name not in RECHECK_PRIORITY)
-    selected = tuple(by_name[name] for name in priority if name not in excluded)[:count]
-    if len(selected) != count:
+    available = [site for site in SITES if site[0] not in excluded]
+    if len(available) < count:
         raise ValueError("Recheck requires %d different additional websites" % count)
-    return selected
+    return tuple(random.sample(available, count))
 
 
 @dataclass
@@ -85,16 +91,9 @@ class ProbeRound:
 
 
 def select_pair(sequence):
-    index = ((sequence - 1) * 2) % len(SITES)
-    sites = (SITES[index], SITES[(index + 1) % len(SITES)])
-    # Two websites on ONE path per round, alternating paths each second. This
-    # can detect a faulty default path even when the local proxy remains good.
-    pair_count = len(SITES) // 2
-    cycle = (sequence - 1) // pair_count
-    # An even pair count needs an explicit path swap after each full rotation.
-    # Its boundary consequently has two consecutive rounds on the same path.
-    offset = cycle if pair_count % 2 == 0 else 0
-    mode = "default_route" if (sequence + offset) % 2 else "nextin_proxy"
+    # Each draw is independent; a website may appear again in the next round.
+    sites = tuple(random.sample(SITES, 2))
+    mode = "default_route" if sequence % 2 else "nextin_proxy"
     return sites, mode
 
 
@@ -143,8 +142,7 @@ class State:
     def result(self, epoch, seq, started, results, mode, phase="regular"):
         previous = self.path_rounds.get(mode)
         expected_count = PHASE_SIZES[phase]
-        # Five sites occupy three dispatch slots; their last request starts two
-        # seconds after the first, before its own normal three-second timeout.
+        # Five sites occupy three dispatch slots; allow the final slot its full timeout.
         window = FRESH_FOR + ((expected_count - 1) // 2) * INTERVAL
         if (epoch != self.epoch or (previous and seq <= previous["seq"])
                 or self.clock() - started >= window):
@@ -163,8 +161,9 @@ class State:
         elif good == 0:
             reason = {"regular": "awaiting_three_site_recheck",
                       "recheck": "awaiting_five_site_verification",
-                      "extended": "extended_verification_failed"}[phase]
-            if phase == "extended":
+                      "extended": "awaiting_final_three_site_verification",
+                      "final": "final_three_verification_failed"}[phase]
+            if phase == "final":
                 self.request_close(mode, seq, reason, results)
         else:
             reason = "verified" if good == expected_count else "one_site_ok"
@@ -179,7 +178,7 @@ class State:
     def should_close(self):
         # A healthy proxy result cannot erase a failed default-path pair (or
         # vice versa); recovery and ordering are evaluated separately per path.
-        return bool(self.alerts) or any(item["reason"] in ("exit_mismatch", "extended_verification_failed")
+        return bool(self.alerts) or any(item["reason"] in ("exit_mismatch", "final_three_verification_failed")
                                        and 0 <= self.clock() - item["completed"] < FRESH_FOR
                                        for item in self.path_rounds.values())
 
@@ -187,7 +186,7 @@ class State:
         reasons = [item["reason"] for item in self.alerts.values()]
         reasons += [item["reason"] for item in self.path_rounds.values()
                     if 0 <= self.clock() - item["completed"] < FRESH_FOR]
-        return "exit_mismatch" if "exit_mismatch" in reasons else "extended_verification_failed"
+        return "exit_mismatch" if "exit_mismatch" in reasons else "final_three_verification_failed"
 
     def status(self):
         good = sum(item["ok"] for item in self.results)
@@ -198,10 +197,70 @@ class State:
                 "results": self.results, "path": self.path, "round": self.last_seq,
                 "path_rounds": self.path_rounds,
                 "alerts": self.alerts,
-                "expected_exit": EXPECTED, "mode": "two_three_five_site_verification_no_firewall",
+                "expected_exit": EXPECTED, "mode": "two_three_five_three_site_verification_no_firewall",
                 "version": VERSION, "site_pool_size": len(SITES),
-                "requests_per_second": 2, "timeout_seconds": TIMEOUT,
+                "site_selection": "random_without_replacement_within_round_or_recheck_chain",
+                "requests_per_second": 2 / INTERVAL, "interval_seconds": INTERVAL, "timeout_seconds": TIMEOUT,
                 "updated_at": time.time(), "pid": os.getpid()}
+
+
+class BatchLogHandler(logging.Handler):
+    """Batch ordinary records; risk and lifecycle evidence bypass the timer."""
+    def __init__(self, path):
+        super().__init__()
+        self.sink = RotatingFileHandler(path, maxBytes=5 * 1048576, backupCount=5)
+        self.sink.setFormatter(logging.Formatter("%(message)s"))
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        self.pending = []
+        self.last_flush = time.monotonic()
+
+    def emit(self, record):
+        self.pending.append(self.format(record))
+        urgent = record.levelno >= logging.ERROR or record.getMessage().startswith(
+            ("exit_mismatch", "apps_", "close_attempt", "monitor_", "topology_"))
+        if urgent or len(self.pending) >= 256:
+            self.flush()
+
+    def flush(self):
+        self.acquire()
+        try:
+            if self.pending:
+                record = logging.LogRecord("exitwatch", logging.INFO, "", 0,
+                                           "\n".join(self.pending), (), None)
+                self.sink.emit(record)
+                self.pending.clear()
+            self.last_flush = time.monotonic()
+        finally:
+            self.release()
+
+    def close(self):
+        self.flush()
+        self.sink.close()
+        super().close()
+
+
+class StatusPublisher:
+    def __init__(self):
+        self.last_write = -float("inf")
+        self.last_risk = None
+
+    def publish(self, value, now):
+        risk = (value.get("close_apps"), value.get("reason") if value.get("close_apps") else None)
+        if now - self.last_write >= STATUS_INTERVAL or risk != self.last_risk:
+            write_status(value)
+            self.last_write, self.last_risk = now, risk
+
+
+def app_snapshot(table):
+    selected = targets(table)
+    groups = {"Claude": [], "Codex": []}
+    for pid in sorted(selected):
+        item = table[pid]
+        if item["ppid"] in selected:
+            continue
+        app = "Claude" if (item["path"].startswith(ROOTS[0]) or item["path"].startswith(ROOTS[2])) else "Codex"
+        groups[app].append({"pid": pid, "birth": item["birth"], "path": item["path"]})
+    return {name: {"running": bool(roots), "roots": roots} for name, roots in groups.items()}
 
 
 class CommandError(RuntimeError):
@@ -249,10 +308,16 @@ async def probe(site, mode):
         if len(values) != 1:
             raise ValueError("Response does not contain exactly one ip= field")
         value = values[0]
-    elif kind == "json_ip":
-        value = json.loads(body)["ip"]
+    elif kind in ("json_ip", "json_ip_address", "json_origin"):
+        field = {"json_ip": "ip", "json_ip_address": "ipAddress", "json_origin": "origin"}[kind]
+        data = json.loads(body)
+        if not isinstance(data, dict) or "error" in data or data.get("success") is False:
+            raise ValueError("IP API returned an error or an invalid object")
+        value = data[field]
         if not isinstance(value, str):
-            raise ValueError("JSON ip field must be a string")
+            raise ValueError("JSON IP field must be a string")
+        # An origin list is ambiguous; never choose one address from a chain.
+        # The common ip_address validation below rejects lists and other text.
     elif kind == "ipip0_html":
         # Read only the server's prefilled visitor-IP field on an unparameterized
         # GET. Do not treat queried-IP results, ads or other HTML IPs as evidence.
@@ -341,10 +406,20 @@ async def stop_apps(should_close):
     # Stop every selected process before killing parents, so descendants cannot
     # keep sending while their parent is being terminated. This cannot retract
     # packets already queued in the kernel or sent onto the network.
+    logging.warning("apps_close_targets=%s", json.dumps(
+        [{"pid": pid, **current[pid]} for pid in confirmed], ensure_ascii=False))
     for sig in (signal.SIGSTOP, signal.SIGKILL):
-        for pid in confirmed:
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, sig)
+        delivered, gone = [], []
+        try:
+            for pid in confirmed:
+                try:
+                    os.kill(pid, sig)
+                    delivered.append(pid)
+                except ProcessLookupError:
+                    gone.append(pid)
+        finally:
+            # Delivery is not proof of exit; the process observer logs subsequent absence.
+            logging.warning("apps_signal signal=%s delivered=%s already_gone=%s", sig.name, delivered, gone)
     return confirmed
 
 
@@ -352,7 +427,7 @@ def write_status(value):
     LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = LOGS / "status.json"
     temporary = LOGS / ("status.%d.tmp" % os.getpid())
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2))
+    temporary.write_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
     temporary.replace(path)
 
 
@@ -362,17 +437,32 @@ class Monitor:
         self.sequence = 0
         self.topology_ok = False
         self.current_topology = None
+        self.topology_observed_at = None
+        self.topology_error = None
         self.checks = set()
         self.rotation = 0
         self.rechecks = {}
         self.recheck_queue = deque()
+        self.apps_observed = {"observed_at": None, "apps": None}
+        self.app_fingerprint = None
+        self.app_heartbeat = -float("inf")
+        self.last_close_audit = None
+        self.publisher = StatusPublisher()
+
+    def apps_evidence(self):
+        observed = self.apps_observed
+        apps = observed.get("apps")
+        return {"observed_at": observed["observed_at"],
+                "apps": None if apps is None else {name: {"running": group["running"],
+                         "root_pids": [item["pid"] for item in group["roots"]]}
+                         for name, group in apps.items()}}
 
     def queue_recheck(self, original):
         active = self.rechecks.get(original.mode)
-        if (original.epoch != self.state.epoch or original.phase == "extended"
+        if (original.epoch != self.state.epoch or original.phase == "final"
                 or (active is not None and active is not original)):
             return
-        phase = "recheck" if original.phase == "regular" else "extended"
+        phase = {"regular": "recheck", "recheck": "extended", "extended": "final"}[original.phase]
         excluded = set(original.excluded_sites) | {site[0] for site in original.sites}
         self.sequence += 1
         sites = select_recheck_sites(excluded, PHASE_SIZES[phase])
@@ -385,9 +475,18 @@ class Monitor:
 
     async def check_site(self, batch, site):
         started = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        observed_topology = {"connected_and_default_route": self.topology_ok,
+                             "interface": self.current_topology[1] if self.current_topology else None,
+                             "observed_at": self.topology_observed_at,
+                             "epoch": self.state.epoch}
         if batch.started is None:
             batch.started = started
+        apps_at_start = self.apps_evidence()
         result = await probe_result(site, batch.mode)
+        result.update(started_at=started_at, completed_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                      topology_at_start=observed_topology, topology_epoch_at_completion=self.state.epoch,
+                      apps_at_start=apps_at_start, apps_at_completion=self.apps_evidence())
         # A concrete wrong IP acts immediately, even while the other sites wait.
         if self.state.observe_mismatch(batch.epoch, batch.seq, started, result, batch.mode):
             logging.warning("exit_mismatch round=%s phase=%s result=%s", batch.seq, batch.phase,
@@ -402,11 +501,11 @@ class Monitor:
                          batch.seq, batch.mode, [item["site"] for item in results], good,
                          len(results), batch.phase, "close_apps" if self.state.should_close()
                          else "keep_running", self.state.reason)
-            if good < len(results):
-                logging.warning("round_details=%s", json.dumps({"round": batch.seq,
-                                "phase": batch.phase, "trigger_round": batch.trigger_seq,
-                                "results": results}, ensure_ascii=False))
-            if batch.phase != "extended" and good == 0 and not any(
+            logging.log(logging.WARNING if good < len(results) else logging.INFO,
+                        "round_details=%s", json.dumps({"round": batch.seq,
+                        "phase": batch.phase, "trigger_round": batch.trigger_seq,
+                        "results": results}, ensure_ascii=False))
+            if batch.phase != "final" and good == 0 and not any(
                     r.get("outcome") == "exit_mismatch" for r in results):
                 self.queue_recheck(batch)
         if batch.phase != "regular" and self.rechecks.get(batch.mode) is batch:
@@ -445,12 +544,17 @@ class Monitor:
         return tasks
 
     def invalidate(self, reason):
+        logging.info("topology_epoch_changed reason=%s old_epoch=%s new_epoch=%s", reason,
+                     self.state.epoch, self.state.epoch + 1)
         self.state.invalidate(reason)
         self.recheck_queue.clear()
         self.rechecks.clear()
 
     def status(self):
         value = self.state.status()
+        value["apps_observed"] = self.apps_observed
+        value["status_write_interval_seconds"] = STATUS_INTERVAL
+        value["log_flush_interval_seconds"] = LOG_FLUSH_INTERVAL
         value["pending_rechecks"] = {mode: {"round": batch.seq, "trigger_round": batch.trigger_seq,
                                           "phase": batch.phase,
                                           "sites": [site[0] for site in batch.sites],
@@ -475,14 +579,49 @@ class Monitor:
         while True:
             try:
                 current = await topology()
+                self.topology_observed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
                 if current != self.current_topology:
                     self.invalidate("network_changed_waiting_for_pair")
+                    logging.info("topology_observed connected_and_default_route=true interface=%s", current[1])
                 self.current_topology, self.topology_ok = current, True
-            except Exception:
+                self.topology_error = None
+            except Exception as exc:
+                self.topology_observed_at = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                error = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+                if self.topology_ok or self.topology_error != error:
+                    logging.warning("topology_observed connected_and_default_route=false error=%s", error)
+                self.topology_error = error
                 if self.topology_ok:
                     self.invalidate("tunnel_unavailable_waiting_for_pair")
                 self.current_topology, self.topology_ok = None, False
             await asyncio.sleep(.5)
+
+    async def apps_loop(self):
+        while True:
+            try:
+                snapshot = app_snapshot(await asyncio.to_thread(process_table))
+                observed = {"observed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                            "apps": snapshot}
+                fingerprint = json.dumps(snapshot, sort_keys=True)
+                now = time.monotonic()
+                if fingerprint != self.app_fingerprint or now - self.app_heartbeat >= 60:
+                    event = "apps_state_changed" if self.app_fingerprint is not None and fingerprint != self.app_fingerprint else "apps_state_snapshot"
+                    logging.info("%s=%s", event, json.dumps(observed, ensure_ascii=False))
+                    self.app_heartbeat = now
+                self.app_fingerprint = fingerprint
+                self.apps_observed = observed
+            except (OSError, subprocess.SubprocessError):
+                self.apps_observed = {"observed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                                      "apps": None, "error": "process_discovery_failed"}
+                logging.exception("apps_observation_failed")
+            await asyncio.sleep(APP_POLL_INTERVAL)
+
+    async def log_flush_loop(self):
+        while True:
+            for handler in logging.getLogger().handlers:
+                if isinstance(handler, BatchLogHandler) and time.monotonic() - handler.last_flush >= LOG_FLUSH_INTERVAL:
+                    handler.flush()
+            await asyncio.sleep(1)
 
     async def safety_loop(self):
         while True:
@@ -496,16 +635,24 @@ class Monitor:
                     killed = []
                 else:
                     self.state.acknowledge_close(tokens)
+                audit_key = (reason, tuple(sorted(tokens.items())), tuple(killed))
+                if audit_key != self.last_close_audit:
+                    logging.warning("close_attempt reason=%s target_pids=%s latest_apps_observation=%s", reason, killed,
+                                    json.dumps(self.apps_observed, ensure_ascii=False))
+                    self.last_close_audit = audit_key
                 if killed:
                     logging.warning("apps stopped: reason=%s pids=%s", reason, killed)
-            write_status(self.status())
+            self.publisher.publish(self.status(), time.monotonic())
             await asyncio.sleep(.25)
 
     async def run(self):
         # Startup, topology changes and stale results do not independently close
-        # apps. A wrong IP or a failed final five-site check can do that.
+        # apps. A wrong IP or a failed final three-site check can do that.
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
         tasks = [asyncio.create_task(coro()) for coro in
-                 (self.exit_loop, self.topology_loop, self.safety_loop)]
+                 (self.apps_loop, self.exit_loop, self.topology_loop, self.safety_loop, self.log_flush_loop)]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -515,6 +662,17 @@ class Monitor:
             for task in tasks + list(self.checks):
                 task.cancel()
             await asyncio.gather(*tasks, *self.checks, return_exceptions=True)
+
+
+def log_control(event, **details):
+    LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
+    handler = RotatingFileHandler(LOGS / "control.log", maxBytes=1048576, backupCount=2)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    try:
+        handler.emit(logging.LogRecord("control", logging.INFO, "", 0,
+                     json.dumps(dict(event=event, **details), ensure_ascii=False), (), None))
+    finally:
+        handler.close()
 
 
 def install():
@@ -535,6 +693,7 @@ def install():
 
 
 def start():
+    log_control("monitor_start_requested")
     if not PLIST.exists():
         install()
     domain = "gui/%d" % os.getuid()
@@ -542,13 +701,16 @@ def start():
     loaded = subprocess.run(["/bin/launchctl", "print", domain + "/" + LABEL], capture_output=True)
     if loaded.returncode:
         subprocess.run(["/bin/launchctl", "bootstrap", domain, str(PLIST)], check=True)
-    print("检测已启动并设为登录自启。每秒最多两个请求；错误 IP 立即关闭，超时按 2→3→5 个网站验证。")
+    log_control("monitor_start_command_completed")
+    print("检测已启动并设为登录自启。每三秒最多两个请求；错误 IP 立即关闭，超时按 2→3→5→3 个网站验证。")
 
 
 def stop():
+    log_control("monitor_stop_requested")
     service = "gui/%d/%s" % (os.getuid(), LABEL)
     subprocess.run(["/bin/launchctl", "disable", service], check=True)
-    subprocess.run(["/bin/launchctl", "bootout", service], capture_output=True)
+    result = subprocess.run(["/bin/launchctl", "bootout", service], capture_output=True)
+    log_control("monitor_stop_command_completed", bootout_code=result.returncode)
     write_status({"running": False, "reason": "stopped_by_user", "updated_at": time.time()})
     print("检测已停止，登录自启已关闭；网络设置未变。")
 
@@ -557,7 +719,7 @@ async def check_once():
     monitor = Monitor()
     await monitor.check(0, 1, time.monotonic())
     # Use the same overlapping dispatch cadence as the service. Awaiting each
-    # two-request batch separately would make the final five-site group stale.
+    # two-request batch separately would make the final three-site group stale.
     while monitor.rechecks and not monitor.state.should_close():
         await asyncio.sleep(INTERVAL)
         if monitor.rechecks and not monitor.state.should_close():
@@ -573,19 +735,23 @@ def main():
     action = parser.parse_args().action
     if action == "run":
         LOGS.mkdir(mode=0o700, parents=True, exist_ok=True)
-        handler = RotatingFileHandler(LOGS / "watch.log", maxBytes=1048576, backupCount=3)
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        handler = BatchLogHandler(LOGS / "watch.log")
         logging.basicConfig(level=logging.INFO, handlers=[handler])
-        logging.info("monitor_started version=%s sites=%s requests_per_second=2 timeout=%s policy=mismatch_or_two_three_five_site_verification",
-                     VERSION, len(SITES), TIMEOUT)
+        logging.info("monitor_started pid=%s status_write_seconds=2 log_batch_seconds=10 app_poll_seconds=1 version=%s sites=%s interval_seconds=%s requests_per_second=%s timeout=%s site_selection=random policy=mismatch_or_two_three_five_three_site_verification",
+                     os.getpid(), VERSION, len(SITES), INTERVAL, 2 / INTERVAL, TIMEOUT)
         monitor = Monitor()
         try:
             asyncio.run(monitor.run())
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logging.info("monitor_stopped reason=termination_signal pid=%s", os.getpid())
         except BaseException:
-            # An internal exception is not a completed five-site verification.
+            logging.exception("monitor_failed pid=%s", os.getpid())
+            # An internal exception is not a completed final three-site verification.
             write_status({"exit_confirmed": False, "close_apps": False,
                           "reason": "monitor_failed", "updated_at": time.time()})
             raise
+        finally:
+            handler.flush()
     elif action == "check":
         raise SystemExit(0 if asyncio.run(check_once()) else 1)
     elif action == "status":
